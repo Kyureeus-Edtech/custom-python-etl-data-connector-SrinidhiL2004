@@ -1,0 +1,13 @@
+# Python artifacts
+__pycache__/
+*.pyc
+.env
+.env.*
+*.sqlite3
+
+# Editor/IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
