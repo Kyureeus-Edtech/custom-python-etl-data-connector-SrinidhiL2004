@@ -1,234 +1,161 @@
-#!/usr/bin/env python3
-"""
-etl_connector.py
-Generic Python ETL connector template.
-
-Usage:
-  - Create a .env file with MONGO_URI, MONGO_DB, API_KEY, etc.
-  - pip install -r requirements.txt
-  - python etl_connector.py
-"""
-
 import os
-import time
-import logging
-from datetime import datetime
-from typing import Dict, List, Any, Optional
-
 import requests
+import json
+from datetime import datetime
 from dotenv import load_dotenv
-from pymongo import MongoClient, UpdateOne
-from pymongo.errors import PyMongoError
+from pymongo import MongoClient
+# Corrected PyMongo Import
+from pymongo.errors import ConnectionFailure as PyMongoConnectionError 
 
-# Load environment variables
+# --- 1. Setting Up the Connector Environment ---
+
+# Load environment variables from .env file
 load_dotenv()
 
-# Configuration (set in .env)
-API_BASE_URL = os.getenv("API_BASE_URL", "https://api.example.com")
-API_ENDPOINT = os.getenv("API_ENDPOINT", "/v1/items")
-API_KEY = os.getenv("API_KEY", "")
-PAGE_SIZE = int(os.getenv("PAGE_SIZE", "100"))
-RATE_LIMIT_SLEEP = float(os.getenv("RATE_LIMIT_SLEEP", "1.0"))  # seconds between requests
-MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
-MONGO_DB = os.getenv("MONGO_DB", "etl_db")
-CONNECTOR_NAME = os.getenv("CONNECTOR_NAME", "example_connector")  # used for collection name
-UNIQUE_ID_FIELD = os.getenv("UNIQUE_ID_FIELD", "id")  # field in payload used as unique key
+# API Configuration (GreyNoise Community API)
+GREYNOISE_BASE_URL = "https://api.greynoise.io/v3/community/"
 
-# Setup logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
-)
-logger = logging.getLogger(__name__)
+# MongoDB Configuration
+MONGO_URI = os.getenv("MONGO_URI")
+MONGO_DB_NAME = os.getenv("MONGO_DB_NAME")
+MONGO_COLLECTION_NAME = os.getenv("MONGO_COLLECTION_NAME")
 
+# List of IPs to check - For demonstration purposes
+IPS_TO_CHECK = [
+    "1.2.3.4",         
+    "8.8.8.8",         
+    "192.0.2.1",       
+    "195.72.230.190"   
+]
 
-def get_mongo_client(uri: str) -> MongoClient:
-    try:
-        client = MongoClient(uri, serverSelectionTimeoutMS=5000)
-        # Trigger a server selection to validate connection
-        client.admin.command("ping")
-        logger.info("Connected to MongoDB")
-        return client
-    except PyMongoError as e:
-        logger.exception("Could not connect to MongoDB: %s", e)
-        raise
+# ----------------------------------------------------------------------
+## ETL Functions
+# ----------------------------------------------------------------------
 
-
-def fetch_page(session: requests.Session, page: int) -> Optional[Dict[str, Any]]:
+def extract_data(ip: str) -> dict:
     """
-    Fetch one page from the API and return parsed JSON or None on permanent failure.
-    Adjust query params or pagination style to match the API.
+    E: Connects to the GreyNoise Community API WITHOUT an API key (unauthenticated).
+    Note: This is subject to very low rate limits (e.g., 50 searches per week).
     """
-    url = f"{API_BASE_URL.rstrip('/')}{API_ENDPOINT}"
-    params = {
-        "page": page,
-        "per_page": PAGE_SIZE,
-        "api_key": API_KEY  # or use headers; depends on provider
-    }
+    print(f"-> Extracting data for IP: {ip}...")
+    
+    # Headers only include Accept type - NO 'key' HEADER IS USED
     headers = {
-        "Accept": "application/json"
+        "Accept": "application/json",
     }
 
-    # Make request with basic retry/backoff
-    max_retries = 3
-    backoff = 1.0
-    for attempt in range(1, max_retries + 1):
-        try:
-            resp = session.get(url, params=params, headers=headers, timeout=15)
-            if resp.status_code == 200:
-                return resp.json()
-            elif resp.status_code == 429:
-                # Rate limited: sleep and retry; respect Retry-After if present
-                retry_after = resp.headers.get("Retry-After")
-                sleep_for = float(retry_after) if retry_after else RATE_LIMIT_SLEEP * backoff
-                logger.warning("Rate limited (429). Sleeping for %s seconds.", sleep_for)
-                time.sleep(sleep_for)
-            elif 500 <= resp.status_code < 600:
-                logger.warning("Server error %s. Attempt %s/%s", resp.status_code, attempt, max_retries)
-                time.sleep(RATE_LIMIT_SLEEP * backoff)
-            else:
-                logger.error("Request failed: %s %s", resp.status_code, resp.text[:500])
-                return None
-        except requests.RequestException as e:
-            logger.warning("Request exception: %s. Attempt %s/%s", e, attempt, max_retries)
-            time.sleep(RATE_LIMIT_SLEEP * backoff)
-        backoff *= 2
-    logger.error("Failed to fetch page %s after %s attempts", page, max_retries)
-    return None
-
-
-def transform_record(rec: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Transform raw API record into Mongo-ready document.
-    Minimal example:
-      - ensure types are consistent
-      - remove nested fields not required
-      - compute ingestion metadata
-    Customize as per your API schema.
-    """
-    # Example transformations. Replace with real mapping logic.
-    doc = dict(rec)  # shallow copy
-    # Normalise timestamp fields to ISODate strings
-    if "timestamp" in doc:
-        try:
-            dt = datetime.fromisoformat(doc["timestamp"])
-            doc["timestamp"] = dt.isoformat()
-        except Exception:
-            # keep original if parsing fails
-            pass
-
-    # Add ingestion metadata
-    doc["_ingested_at"] = datetime.utcnow()
-    doc["_source_connector"] = CONNECTOR_NAME
-    return doc
-
-
-def upsert_documents(collection, docs: List[Dict[str, Any]]) -> int:
-    """
-    Perform bulk upsert (idempotent loads). Returns number inserted/updated count.
-    Uses UNIQUE_ID_FIELD to match existing docs.
-    """
-    if not docs:
-        return 0
-    operations = []
-    for d in docs:
-        if UNIQUE_ID_FIELD not in d:
-            # skip or log; we expect a unique key
-            logger.warning("Record missing unique id field '%s': %s", UNIQUE_ID_FIELD, d)
-            continue
-        filter_q = {UNIQUE_ID_FIELD: d[UNIQUE_ID_FIELD]}
-        update_doc = {"$set": d}
-        operations.append(UpdateOne(filter_q, update_doc, upsert=True))
-
-    if not operations:
-        return 0
-
+    url = f"{GREYNOISE_BASE_URL}{ip}"
+    
     try:
-        result = collection.bulk_write(operations, ordered=False)
-        upserted = (result.upserted_count if hasattr(result, "upserted_count") else 0)
-        modified = result.modified_count if hasattr(result, "modified_count") else 0
-        logger.info("Bulk write result: upserted=%s, modified=%s", upserted, modified)
-        return upserted + modified
-    except PyMongoError as e:
-        logger.exception("Bulk write failed: %s", e)
-        return 0
+        response = requests.get(url, headers=headers, timeout=10)
+        
+        # Iterative Testing & Validation: Handle non-200 responses
+        if response.status_code == 429:
+            print(f"   [RATE LIMIT ERROR] Rate limit hit for IP {ip}. You have exceeded the unauthenticated limit.")
+            return {"error": "Rate Limit Exceeded (Unauthenticated)", "ip": ip, "status_code": 429}
+        
+        if response.status_code == 404:
+            print(f"   [NOT FOUND] IP {ip} not found in GreyNoise Community data.")
+            return {"error": "IP Not Found", "ip": ip, "status_code": 404}
+
+        if response.status_code != 200:
+            print(f"   [API ERROR] Failed for IP {ip} with status code {response.status_code}.")
+            return {"error": f"API Error: Status {response.status_code}", "ip": ip, "status_code": response.status_code}
+
+        # Successful extraction
+        return response.json()
+        
+    except requests.exceptions.RequestException as e:
+        print(f"   [CONNECTIVITY ERROR] Connection error for IP {ip}: {e}")
+        return {"error": f"Connectivity Error: {e}", "ip": ip, "status_code": 0}
+
+def transform_data(raw_record: dict) -> dict | None:
+    """
+    T: Cleans and reformats the data for MongoDB compatibility, adding audit fields.
+    """
+    ingestion_time = datetime.utcnow()
+    
+    if 'error' in raw_record:
+        # If extraction failed, return a minimal record for audit
+        return {
+            "ip": raw_record.get('ip', 'N/A'),
+            "ingestion_timestamp": ingestion_time,
+            "status": "Extraction Failed",
+            "error_details": raw_record.get('error'),
+            "status_code": raw_record.get('status_code', 0)
+        }
+    
+    # Transformation: Add the audit field to the successful record
+    transformed = {
+        **raw_record, 
+        "ingestion_timestamp": ingestion_time
+    }
+    
+    if 'ip' not in transformed:
+        print(f"   [TRANSFORM WARNING] Record missing 'ip' field. Skipping or marking for audit.")
+        return None 
+
+    return transformed
+
+def load_data(data_to_load: list[dict], mongo_uri: str, db_name: str, collection_name: str):
+    """
+    L: Stores the transformed data into the specified MongoDB collection.
+    """
+    if not data_to_load:
+        print("-> No valid data to load. Exiting load phase.")
+        return
+
+    print(f"\n-> Attempting to connect to MongoDB...")
+    client = None
+    try:
+        client = MongoClient(mongo_uri)
+        client.admin.command('ping')
+        print("   Connection to MongoDB successful.")
+
+        db = client[db_name]
+        collection = db[collection_name]
+
+        insert_result = collection.insert_many(data_to_load, ordered=False)
+        
+        print(f"   Successfully loaded {len(insert_result.inserted_ids)} records into '{collection_name}'.")
+
+    except PyMongoConnectionError as e:
+        print(f"   [MONGO ERROR] MongoDB Connection Error: {e}")
+        print("   Data not loaded due to connection failure. Check MONGO_URI and IP whitelist.")
+    except Exception as e:
+        print(f"   [MONGO ERROR] An unexpected error occurred during data loading: {e}")
+    finally:
+        if client:
+            client.close()
+            print("   MongoDB connection closed.")
 
 
-def run_etl():
-    # Initialize HTTP session and Mongo
-    session = requests.Session()
-    client = get_mongo_client(MONGO_URI)
-    db = client[MONGO_DB]
-    collection_name = f"{CONNECTOR_NAME}_raw"
-    collection = db[collection_name]
-    logger.info("Using collection: %s.%s", MONGO_DB, collection_name)
+def run_etl_pipeline():
+    """
+    Orchestrates the complete ETL pipeline.
+    """
+    print("--- Starting GreyNoise Community ETL Pipeline (Unauthenticated) ---")
+    
+    transformed_records = []
+    
+    for ip in IPS_TO_CHECK:
+        # 1. Extract
+        raw_data = extract_data(ip)
+        
+        # 2. Transform
+        transformed_record = transform_data(raw_data)
+        
+        if transformed_record:
+            transformed_records.append(transformed_record)
 
-    page = 1
-    total_processed = 0
-    consecutive_empty_pages = 0
-    max_empty_pages = 3  # stop if many empty pages in a row (depends on API)
-
-    while True:
-        payload = fetch_page(session, page)
-        if payload is None:
-            logger.error("Stopping ETL due to fetch failure for page %s", page)
-            break
-
-        # Adjust access path depending on response schema
-        # e.g., {'data': [...], 'meta': {...}}
-        records = payload.get("data") if isinstance(payload, dict) and "data" in payload else payload
-        if isinstance(records, dict):
-            # if API returns an object with items under a key
-            # try common keys:
-            for k in ("items", "results", "data"):
-                if k in records:
-                    records = records[k]
-                    break
-
-        if not records:
-            logger.info("No records on page %s", page)
-            consecutive_empty_pages += 1
-            if consecutive_empty_pages >= max_empty_pages:
-                logger.info("Stopping: %s consecutive empty pages", consecutive_empty_pages)
-                break
-            page += 1
-            continue
-
-        consecutive_empty_pages = 0
-
-        # Validate and transform
-        transformed = []
-        for rec in records:
-            # Basic validation: ensure dict-like structure
-            if not isinstance(rec, dict):
-                logger.warning("Skipping record not a dict: %s", rec)
-                continue
-            transformed.append(transform_record(rec))
-
-        # Load into MongoDB with upserts for idempotency
-        processed = upsert_documents(collection, transformed)
-        total_processed += processed
-        logger.info("Page %s processed; %s docs upserted/modified. Total so far: %s", page, processed, total_processed)
-
-        # Pagination break conditions - adapt to API: next link in payload, or page size < PAGE_SIZE
-        # Example: if results less than page size, we've reached the end
-        if isinstance(records, list) and len(records) < PAGE_SIZE:
-            logger.info("Last page detected (len < PAGE_SIZE). Stopping.")
-            break
-
-        page += 1
-        time.sleep(RATE_LIMIT_SLEEP)  # polite sleep to avoid hitting rate limits
-
-    logger.info("ETL finished. Total documents processed: %s", total_processed)
-    client.close()
+    # 3. Load
+    load_data(transformed_records, MONGO_URI, MONGO_DB_NAME, MONGO_COLLECTION_NAME)
+    
+    print("\n--- ETL Pipeline Finished ---")
 
 
 if __name__ == "__main__":
-    try:
-        start = datetime.utcnow()
-        logger.info("ETL run started at %s", start.isoformat())
-        run_etl()
-        logger.info("ETL run completed at %s", datetime.utcnow().isoformat())
-    except Exception as e:
-        logger.exception("Unhandled exception in ETL: %s", e)
-        raise
+    if not all([MONGO_URI, MONGO_DB_NAME, MONGO_COLLECTION_NAME]):
+        print("FATAL ERROR: Missing one or more critical MongoDB environment variables in .env.")
+    else:
+        run_etl_pipeline()
